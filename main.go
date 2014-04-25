@@ -15,7 +15,6 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
-	"path"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -47,6 +46,121 @@ var (
 	localFolder = flag.String("localfolder", "", "The folder on the local file system")
 )
 
+func getDriveFilesByFolder(service *drive.Service, folderName string) (map[string]*drive.File, string) {
+	query := fmt.Sprintf("mimeType = 'application/vnd.google-apps.folder' and title = '%s'", folderName)
+	folderList, err := service.Files.List().Q(query).Do()
+	log.Printf("Got folderList, err: %#v, %v", folderList, err)
+
+	if len(folderList.Items) != 1 {
+		log.Fatalf("Number of folders: %d != 1 for %s on Google Drive", len(folderList.Items), *driveFolder)
+	}
+
+	files := make(map[string]*drive.File)
+
+	folderId := folderList.Items[0].Id
+	query = fmt.Sprintf("'%s' in parents", folderId)
+	fileList, err := service.Files.List().Q(query).Do()
+	log.Printf("Got fileList, err: %#v, %v", fileList, err)
+	for _, file := range fileList.Items {
+		key := fmt.Sprintf("%s:%s", file.Title, file.Md5Checksum)
+		files[key] = file
+	}
+
+	doPaging := true
+	for doPaging && fileList.NextPageToken != "" {
+		log.Printf("Going to the next page")
+		fileList, err = service.Files.List().Q(query).PageToken(fileList.NextPageToken).Do()
+		for _, file := range fileList.Items {
+			key := fmt.Sprintf("%s:%s", file.Title, file.Md5Checksum)
+			files[key] = file
+		}
+	}
+
+	return files, folderId
+}
+
+type File struct {
+	filename string
+	base string
+	md5 string
+}
+
+func getLocalFiles(folderName string) map[string]File {
+	files := make(map[string]File)
+
+	glob := filepath.Join(folderName, "*")
+	filenames, _ := filepath.Glob(glob)
+	for _, filename := range filenames {
+		file, err := os.Open(filename)
+		if err != nil {
+			log.Fatalf("Failed to open %s", filename)
+		}
+
+		md5er := md5.New()
+		io.Copy(md5er, file)
+		hash := fmt.Sprintf("%x", md5er.Sum(nil))
+		file.Close()
+
+		base := filepath.Base(filename)
+		key := fmt.Sprintf("%s:%s", base, hash)
+		files[key] = File{filename, base, hash}
+	}
+
+	return files
+}
+
+func mergeFolders(driveFiles map[string]*drive.File, localFiles map[string]File) []File {
+	var remote []*drive.File
+	var local []File
+
+	synced := make(map[string]bool)
+
+	for key, file := range driveFiles {
+		_, ok := localFiles[key]
+		if !ok {
+			remote = append(remote, file)
+		} else {
+			synced[key] = true
+		}
+	}
+
+	for key, file := range localFiles {
+		_, ok := driveFiles[key]
+		if !ok {
+			local = append(local, file)
+		} else {
+			synced[key] = true
+		}
+	}
+
+	fmt.Printf("%v files are synced correctly\n", len(synced))
+
+	if len(remote) > 0 {
+		fmt.Printf("%v files are visible on remote but not local\n", len(remote))
+		for _, file := range remote {
+			fmt.Printf("%v\t%v\t%v\t%v\t%v\n",
+				file.Title,
+				file.FileSize,
+				file.OwnerNames,
+				file.Md5Checksum,
+				file.Id,
+			)
+		}
+	}
+
+	if len(local) > 0 {
+		fmt.Printf("%v files have not been synched\n", len(local))
+		for _, file := range local {
+			fmt.Printf("%v\t%v\n",
+				file.filename,
+				file.md5,
+			)
+		}
+	}
+
+	return local
+}
+
 func main() {
 	flag.Parse()
 
@@ -57,62 +171,33 @@ func main() {
 	client := getOAuthClient(config)
 	service, _ := drive.New(client)
 
-	query := fmt.Sprintf("mimeType = 'application/vnd.google-apps.folder' and title = '%s'", *driveFolder)
-	folderList, err := service.Files.List().Q(query).Do()
-	log.Printf("Got folderList, err: %#v, %v", folderList, err)
+	// Get the ID here
+	driveFiles, folderId := getDriveFilesByFolder(service, *driveFolder)
+	localFiles := getLocalFiles(*localFolder)
 
-	if len(folderList.Items) != 1 {
-		log.Fatalf("Number of folders: %d != 1 for %s on Google Drive", len(folderList.Items), *driveFolder)
-	}
+	toSync := mergeFolders(driveFiles, localFiles)
 
-	var files []*drive.File = nil
-
-	folderId := folderList.Items[0].Id
-	query = fmt.Sprintf("'%s' in parents", folderId)
-	fileList, err := service.Files.List().Q(query).Do()
-	log.Printf("Got fileList, err: %#v, %v", fileList, err)
-	for _, file := range fileList.Items {
-		files = append(files, file)
-	}
-
-	doPaging := true
-	for doPaging && fileList.NextPageToken != "" {
-		log.Printf("Going to the next page")
-		fileList, err = service.Files.List().Q(query).PageToken(fileList.NextPageToken).Do()
-		for _, file := range fileList.Items {
-			files = append(files, file)
+	// Synchronization
+	fmt.Printf("Synchronizing %v files", len(toSync))
+	for _, file := range toSync {
+		fmt.Printf("Sending %s...", file.filename)
+		goFile, err := os.Open(file.filename)
+		if err != nil {
+			log.Fatalf("Could not open file %s: %s", file.filename, err)
 		}
-	}
-
-	for _, file := range files {
-		filename := path.Join(*localFolder, file.Title)
-		localFile, err := os.Open(filename)
-		localHash := ""
-
-		if err == nil {
-			md5er := md5.New()
-			io.Copy(md5er, localFile)
-			localHash = fmt.Sprintf("%x", md5er.Sum(nil))
-			localFile.Close()
+		driveFile := drive.File{
+			Title: file.base,
+			Parents: []*drive.ParentReference{
+				&drive.ParentReference{Id: folderId},
+			},
 		}
 
-		var status string
-		if localHash == file.Md5Checksum {
-			status = "[contents match]"
-		} else if err != nil {
-			status = fmt.Sprintf("[error: %s]", err)
-		} else {
-			status = fmt.Sprintf("[md5 mismatch: %s", localHash)
+		_, err = service.Files.Insert(&driveFile).Media(goFile).Do()
+		if err != nil {
+			log.Fatal("Could no upload file %s: %s", file.filename, err)
 		}
-
-		fmt.Printf("%v\t%v\t%v\t%v\t%v\t%v\n",
-			file.Title,
-			file.FileSize,
-			file.OwnerNames,
-			file.Md5Checksum,
-			file.Id,
-			status,
-		)
+		goFile.Close()
+		fmt.Println(" done!")
 	}
 }
 
