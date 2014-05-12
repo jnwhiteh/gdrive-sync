@@ -40,8 +40,8 @@ var (
 	secret     = flag.String("secret", "", "OAuth Client Secret.  If non-empty, overrides --secret_file")
 	secretFile = flag.String("secret_file", "clientsecret.dat",
 		"Name of a file containing just the project's OAuth Client Secret from https://code.google.com/apis/console/")
-	cacheToken = flag.Bool("cachetoken", true, "cache the OAuth token")
-	debug      = flag.Bool("debug", false, "show HTTP traffic")
+	cacheToken  = flag.Bool("cachetoken", true, "cache the OAuth token")
+	debug       = flag.Bool("debug", false, "show HTTP traffic")
 	driveFolder = flag.String("drivefolder", "", "The name of a folder on Googel Drive")
 	localFolder = flag.String("localfolder", "", "The folder on the local file system")
 )
@@ -81,8 +81,8 @@ func getDriveFilesByFolder(service *drive.Service, folderName string) (map[strin
 
 type File struct {
 	filename string
-	base string
-	md5 string
+	base     string
+	md5      string
 }
 
 func getLocalFiles(folderName string) map[string]File {
@@ -91,6 +91,14 @@ func getLocalFiles(folderName string) map[string]File {
 	glob := filepath.Join(folderName, "*")
 	filenames, _ := filepath.Glob(glob)
 	for _, filename := range filenames {
+		fileInfo, err := os.Stat(filename)
+		if err != nil {
+			log.Fatalf("Failed to stat %s", filename)
+		}
+		if fileInfo.IsDir() || strings.HasPrefix(fileInfo.Name(), ".") {
+			continue
+		}
+
 		file, err := os.Open(filename)
 		if err != nil {
 			log.Fatalf("Failed to open %s", filename)
@@ -179,8 +187,15 @@ func main() {
 
 	// Synchronization
 	fmt.Printf("Synchronizing %v files", len(toSync))
+
+	work := make(chan uploadRequest, 1)
+	done := make(chan bool, len(toSync))
+	for i := 0; i < 3; i++ {
+		go uploadWorker(service, work, done)
+	}
+
+	total := len(toSync)
 	for _, file := range toSync {
-		fmt.Printf("Sending %s...", file.filename)
 		goFile, err := os.Open(file.filename)
 		if err != nil {
 			log.Fatalf("Could not open file %s: %s", file.filename, err)
@@ -192,12 +207,34 @@ func main() {
 			},
 		}
 
-		_, err = service.Files.Insert(&driveFile).Media(goFile).Do()
+		work <- uploadRequest{&driveFile, goFile, file.filename}
+		total = total - 1
+		log.Printf("%d files left to sync", total)
+	}
+
+	for _, _ = range toSync {
+		<-done
+	}
+	log.Printf("Done synchronizing!")
+}
+
+type uploadRequest struct {
+	driveFile *drive.File
+	localFile *os.File
+	filename  string
+}
+
+func uploadWorker(service *drive.Service, work <-chan uploadRequest, done chan bool) {
+	for req := range work {
+		log.Printf("++ Uploading %s", req.filename)
+		_, err := service.Files.Insert(req.driveFile).Media(req.localFile).Do()
 		if err != nil {
-			log.Fatal("Could no upload file %s: %s", file.filename, err)
+			log.Fatalf("Failed when uploading %s: %s", req.filename, err)
 		}
-		goFile.Close()
-		fmt.Println(" done!")
+
+		log.Printf("-- Done uploading %s", req.filename)
+		req.localFile.Close()
+		done <- true
 	}
 }
 
